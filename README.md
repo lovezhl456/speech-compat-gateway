@@ -6,30 +6,31 @@
 
 [打开现有 8080 拨测页](http://127.0.0.1:8080/mjsip-call-test/)。
 
-| 新分机 | 对照 | SIP/UDP | HTTP | RTP/RTCP |
-|---|---|---:|---:|---|
-| [9910 · 复述](http://127.0.0.1:8080/mjsip-call-test/?route=9910) | 9900 | 15080 | 18110 | 41700–41739 |
-| [9913 · 委派播报](http://127.0.0.1:8080/mjsip-call-test/?case=openai-client-single) | 9903 | 15083 | 18113 | 41800–41839 |
-| [9914 · 查订单](http://127.0.0.1:8080/mjsip-call-test/?route=9914) | 9904 | 15084 | 18114 | 41900–41939 |
+| 分机 | 对照分机 | 经过 18120 的功能 |
+|---|---|---|
+| [9910 · 复述](http://127.0.0.1:8080/mjsip-call-test/?route=9910) | 9900 | 识别和合成 |
+| [9913 · 委派播报](http://127.0.0.1:8080/mjsip-call-test/?case=openai-client-single) | 9903 | 合成 |
+| [9914 · 查订单](http://127.0.0.1:8080/mjsip-call-test/?route=9914) | 9904 | 识别和合成 |
+
+FreeSWITCH 将所有分机桥接到同一个语音中控 SIP/UDP 5070。语音中控按 SIP Request-URI 分流，三个对照分机选择语音网关的 18120 兼容端点。
 
 ## 启停
 
 1. 运行 `./scripts/build.sh -o package`。脚本使用同一工作区已有 Java 17、Maven 和依赖缓存。可用 `MAVEN_REPO_LOCAL` 指定其他缓存。
 2. 首次配置把 MjSIP 项目的 `.local/openai-live.env` 完整复制到本项目的 `.local/openai-live.env`，副本权限设为 `0600`。新服务读取副本中的 `OPENAI_API_KEY` 与 `OPENAI_LIVE_HTTP_PROXY`。轮换密钥时分别更新副本和原文件，并重启对应服务。
-3. 在 [拨测项目](../mjsip-call-test/) 运行 `./start-compat.command all`，或者传入一个新分机号。首次启动生成本项目的 `.local/compat.env`，供新 MjSIP 实例和协议鉴权使用。字段见 [配置模板](config/compat.env.example)。另有 `./scripts/start.sh` 可独立运行兼容网关，再用 `--existing-compat` 启动测试分机。
-4. 已运行的拨测 FreeSWITCH 可用 `python3 -B reload-compat-dialplan.py` 加载新增分机。首次部署 9913 新探针时执行现有的 `install-navigation.py`，通过 Nginx 配置检查后重载。拨测页继续使用原有 8080 入口。
-5. 在 `start-compat.command` 所在终端按 Ctrl+C 停止该次启动的新实例。原分机由原启动入口管理。
+3. 运行 `./scripts/start.sh` 启动语音网关。首次启动会生成本项目的 `.local/compat.env`，供语音中控和语音网关完成协议鉴权。字段见 [配置模板](config/compat.env.example)。
+4. 在 [拨测项目](../mjsip-call-test/) 运行 `./start.command` 启动语音中控和拨测服务。首次部署探针代理时使用拨测项目的 `install-navigation.py`。浏览器继续使用 8080 入口。
+5. 在各自终端按 Ctrl+C 可分别停止拨测服务和语音网关。
 
 ## 架构与数据流
 
 ```mermaid
 flowchart LR
     P["浏览器 / SIP 主叫"] --> F["现有 FreeSWITCH"]
-    F -->|"9900 / 9903 / 9904"| O["原 MjSIP 实例"]
-    O --> V["原腾讯 / 阿里链路"]
-    F -->|"9910 / 9913 / 9914"| N["三个独立 MjSIP 实例"]
+    F -->|"SIP 5070 · 保留被叫分机"| N["一个语音中控 · 按被叫分流"]
+    N -->|"9900 / 9903 / 9904"| V["原腾讯 / 阿里链路"]
     N -->|"9910 / 9914 · 腾讯兼容协议"| C["语音兼容网关 · 18120"]
-    N -->|"全部新分机 · 阿里兼容协议"| C
+    N -->|"9910 / 9913 / 9914 · 阿里兼容协议"| C
     N -->|"9913"| L["GPT-Live / Luna"]
     E["新项目内的密钥副本"] --> C
     C <-->|"PCM 与最终转写"| A["GPT-Live-Transcribe"]
@@ -39,7 +40,7 @@ flowchart LR
 ```mermaid
 sequenceDiagram
     participant P as 主叫
-    participant M as 新 MjSIP
+    participant M as 语音中控 9910
     participant C as 兼容网关
     participant A as OpenAI ASR
     participant B as 业务

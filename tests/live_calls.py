@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 from pathlib import Path
+import socket
 import struct
 import subprocess
 import sys
@@ -79,7 +80,7 @@ class RecordedPhone(Phone):
         while not self.stop_recording.is_set():
             try:
                 packet, source = self.rtp.recvfrom(2048)
-            except TimeoutError:
+            except socket.timeout:
                 continue
             except OSError:
                 return
@@ -128,13 +129,15 @@ def wait_for(predicate, timeout):
     return None
 
 
-def order_idle(route):
-    port = 18092 if route == "9904" else 18114
+def order_idle(route, split_gateway):
+    port = (18092 if route == "9904" else 18114) if split_gateway else 8088
+    tags = "" if split_gateway else f'{{called_number="{route}"}}'
+    idle_metric = f"speech_gateway_streaming_replies{tags} 0.0".encode()
     with urlopen(f"http://127.0.0.1:{port}/actuator/prometheus", timeout=2) as response:
-        return any(line == b"speech_gateway_streaming_replies 0.0" for line in response.read().splitlines())
+        return idle_metric in response.read().splitlines()
 
 
-def measure(route, number, directory, first, second=None, digits=None):
+def measure(route, number, directory, first, second=None, digits=None, split_gateway=False):
     path = directory / f"{route}-{number:02d}.wav"
     result = {"route": route, "round": number, "recording": path.name, "status": "error"}
     phone = RecordedPhone(("127.0.0.1", 15060), route, dtmf=bool(digits), response_timeout=12)
@@ -144,7 +147,7 @@ def measure(route, number, directory, first, second=None, digits=None):
                 initial = wait_for(lambda: phone.downlink(0), 8)
                 if not initial:
                     raise TimeoutError("welcome")
-                if not wait_for(lambda: monotonic() - phone.downlink(0)[-1] > 0.5 and order_idle(route), 35):
+                if not wait_for(lambda: monotonic() - phone.downlink(0)[-1] > 0.5 and order_idle(route, split_gateway), 35):
                     raise TimeoutError("welcome did not finish")
             if digits:
                 start = monotonic()
@@ -152,7 +155,7 @@ def measure(route, number, directory, first, second=None, digits=None):
                 reply = wait_for(lambda: phone.downlink(start), 20)
                 if not reply:
                     raise TimeoutError("DTMF reply")
-                if not wait_for(lambda: monotonic() - phone.downlink(start)[-1] > 0.5 and order_idle(route), 30):
+                if not wait_for(lambda: monotonic() - phone.downlink(start)[-1] > 0.5 and order_idle(route, split_gateway), 30):
                     raise TimeoutError("order reply did not finish")
                 result["status"] = "ok"
                 return result
@@ -170,7 +173,7 @@ def measure(route, number, directory, first, second=None, digits=None):
             result["start_to_first_ms"] = round((reply[0] - onset) * 1000)
             if second is None:
                 finished = wait_for(lambda: monotonic() - phone.downlink(speech_end)[-1] > 1.0
-                                    and (route not in ("9904", "9914") or order_idle(route)), 30)
+                                    and (route not in ("9904", "9914") or order_idle(route, split_gateway)), 30)
                 if not finished:
                     raise TimeoutError("reply did not finish")
             else:
@@ -216,6 +219,7 @@ def main():
     parser.add_argument("--file", type=Path)
     parser.add_argument("--barge", action="store_true")
     parser.add_argument("--digits")
+    parser.add_argument("--split-gateway", action="store_true", help="Use the legacy per-extension HTTP ports.")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     first = audio(args.file or SAMPLES / f"{args.sample}.wav") if not args.digits else []
@@ -224,7 +228,7 @@ def main():
 
     def run(job):
         route, number = job
-        result = measure(route, number, args.directory, first, second, args.digits)
+        result = measure(route, number, args.directory, first, second, args.digits, args.split_gateway)
         print(json.dumps(result, ensure_ascii=False), flush=True)
         return result
 
