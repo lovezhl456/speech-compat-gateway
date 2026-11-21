@@ -74,5 +74,14 @@ sequenceDiagram
 
 - `tests/media.py --ephemeral` 用实际 SDK 和 SIP/RTP 直连测试本机 OpenAI 夹具。
 - `tests/media.py --ephemeral --through-switch` 另起隔离 FreeSWITCH，跑同一组桥接用例。
+- `tests/concurrency.py` 只连本地夹具，验证 ASR／TTS 独立准入、慢读和超时回收、TTS 连接复用及旧任务隔离。两个脚本都支持 `--compat-jar` 和 `--output-dir`。
 - `tests/live_calls.py .local/measure --routes 9900 9910 --sample order-2 --barge --rounds 30 --parallel 6` 走现有 FreeSWITCH 测云端线路，生成逐轮 JSON 和双声道 WAV，左声道为上行、右声道为返听。自动插话指标按录音间隙识别候选边界，需结合录音核对旧音与新音。实际云端拨测按账号用量计费。
-- `/healthz` 返回活动 ASR／TTS 会话与事件计数。运行日志记录会话建立、提交到最终转写、首块合成 PCM 以及终态耗时。
+- `/healthz` 返回 ASR／TTS 各自的活动会话、限额、空闲 TTS 上游数及分类计数。日志记录上游建连、会话就绪、提交到最终转写、发起生成到首块 PCM 和网关首块 PCM 发出等阶段。
+
+## 并发和超时
+
+环境变量 `COMPAT_ASR_LIMIT` 与 `COMPAT_TTS_LIMIT` 默认各为 64。名额按兼容协议独立计数，从 WebSocket 建立起占用，连接及上游任务清理后释放。超限沿用 WebSocket `1013 Busy`。
+
+网关按会话顺序异步发送兼容协议的结果和 PCM，慢读下游触发写入超时并回收该会话。ASR 最终转写等待期限由 `COMPAT_ASR_RESULT_TIMEOUT_MS` 配置，默认 12000 毫秒，从该句提交时开始计时。通话中的静音和断句继续沿用原协议。
+
+TTS 只保留正常结束、能够校验响应归属的上游连接。每条连接一次服务一个任务，空闲 30 秒回收，取消或失败后关闭。默认最多保留 4 条，可通过 `COMPAT_TTS_IDLE_LIMIT` 调整，设为 0 时每个任务新建上游连接。连接复用不会提前发起合成请求。

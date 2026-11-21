@@ -47,3 +47,22 @@
 - 兼容网关 JAR SHA-256 `557b21ebf4f42e2844b9f08a80495f32a0ed2e43d4ffbfa627b3d2d4096906a6`
 - MjSIP JAR SHA-256 `8ab5a20a859b96b5e3160ad8f5f354988f1cb2950adb8686a7b28eab7f79ee2e`
 - 目标模型 `gpt-live-transcribe` 与 `gpt-realtime-2.1-mini`
+
+## 并发优化验收 · 2026-11-21
+
+| 场景 | 结果 |
+|---|---|
+| 混合满载 | 保持 64 路 ASR 的同时，64 个 TTS 任务均到达本地模型夹具并完成。两类超限分别返回 1013，释放后可准入，最终活动会话归零。 |
+| 慢读与超时 | 两条停止读取的 TTS 都被回收，独立连接的 3 秒期限在 3.003 秒关闭。ASR 上游不给最终文本或停止读取时均能回收，其他 ASR 仍可完成。 |
+| TTS 复用 | 两个正常任务共用一条上游连接。夹具在第二任务内投递旧任务音频和终态，主叫侧 PCM 校验逐字节通过。取消回收正确的上游响应，空闲连接按 30 秒期限关闭。 |
+| 实际 SDK／SIP | SIP 直连和隔离 FreeSWITCH 桥接各完成 24 通、峰值 8 路。覆盖 PCMU／PCMA、鉴权、ASR 重连、限流恢复、9910 插话、9913 委派、9914 口述和 DTMF。 |
+
+[并发日志](.local/concurrency-20261121/concurrency-v5.log) · [上游阻塞日志](.local/concurrency-20261121/upstream-stall.log) · [直连日志](.local/concurrency-20261121/direct-v5.log) · [桥接日志](.local/concurrency-20261121/bridge-matched-candidate.log)
+
+从最后一个有效上行帧到第六个频率匹配的下行 RTP 帧，两端各取同样 24 通、峰值 8 路。直连 P95 从 1080 毫秒到 1081 毫秒，桥接从 1262 毫秒到 1266 毫秒。候选早一轮桥接有一通接通后未形成最终转写，复跑的基线与候选均成功，单次异常原因未定。 [直连基线](.local/concurrency-20261121/direct-baseline.log) · [桥接基线](.local/concurrency-20261121/bridge-matched-baseline.log) · [早一轮桥接失败](.local/concurrency-20261121/bridge-final-candidate.log)
+
+同一夹具在 48 路 ASR 发声并突发 12 路 TTS 的负载下，基线两轮均为 84 个 TTS 任务建连 84 次，候选两轮分别建连 56 次和 58 次。两组都完成全部任务。 [基线一](.local/concurrency-20261121/v5-bench-1-baseline.log) · [候选一](.local/concurrency-20261121/v5-bench-2-candidate.log) · [候选二](.local/concurrency-20261121/v5-bench-3-candidate.log) · [基线二](.local/concurrency-20261121/v5-bench-4-baseline.log)
+
+唯一一次真实拨测用于验证复用改造前的并发隔离构建和拆分 TTS 耗时。9910 隔离 SIP 通话获得实际识别和有声复述，ASR／TTS 各建立一次，活动会话归零。从话尾到首个有声下行 RTP 为 4621 毫秒。TTS 首块 PCM 为 2667 毫秒，其中上游会话就绪为 1765 毫秒，发起生成后为 902 毫秒。转写保留「到门口以后先打电话」，前半句用词与样本有偏差。最终构建的 TTS 复用及并发容量均使用本地夹具验收。 [单通结果](.local/concurrency-20261121/live-single/result.log) · [录音](.local/concurrency-20261121/live-single/9910-01.wav)
+
+最终候选 JAR SHA-256 为 `e5d5a718e33c7830e3696036ca6b6baeb7162daaa95aca9fe3f16a32c7e76259`。上述隔离验收期间，18120 实例运行原版本。 [候选 JAR](.local/concurrency-20261121/build-v5/target/speech-compat-gateway-0.1.0-SNAPSHOT.jar)

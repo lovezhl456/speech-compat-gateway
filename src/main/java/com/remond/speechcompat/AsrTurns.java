@@ -159,6 +159,15 @@ final class AsrTurns {
         return event;
     }
 
+    long oldestPendingNanos() {
+        // Acknowledgements take turns from committed in order, so any acknowledged turn is older.
+        if (!byItem.isEmpty()) {
+            return byItem.values().iterator().next().committedNanos;
+        }
+        Turn first = committed.peekFirst();
+        return first == null ? 0 : first.committedNanos;
+    }
+
     private ObjectNode message(String type) {
         return json.createObjectNode().put("type", type);
     }

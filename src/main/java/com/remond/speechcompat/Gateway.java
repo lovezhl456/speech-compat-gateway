@@ -7,13 +7,20 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.http.HttpStatus;
@@ -39,15 +46,48 @@ public class Gateway implements WebSocketConfigurer {
     private static final Logger LOG = LoggerFactory.getLogger(Gateway.class);
     private final ObjectMapper json = new ObjectMapper();
     private final Auth auth = new Auth();
-    private final OpenAi upstream = new OpenAi(json);
+    private final Object admission = new Object();
     private final Map<String, Call> calls = new ConcurrentHashMap<>();
-    private final java.util.concurrent.Semaphore slots = new java.util.concurrent.Semaphore(64);
     private final Map<String, LongAdder> counts = new ConcurrentHashMap<>();
-    private final java.util.concurrent.ScheduledThreadPoolExecutor timers =
-            (java.util.concurrent.ScheduledThreadPoolExecutor) Executors.newScheduledThreadPool(2);
+    private final ExecutorService writers = workers(4, "compat-client-write");
+    private final ExecutorService closers = workers(8, "compat-client-close");
+    private final ExecutorService commands = workers(4, "compat-model-write");
+    private final ExecutorService stageLogs = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1024), work -> worker(work, "compat-stage-log"),
+            (work, executor) -> count("stage_log_dropped"));
+    private final ScheduledThreadPoolExecutor timers = new ScheduledThreadPoolExecutor(2);
+    private final OpenAi upstream;
+    private final Semaphore asrSlots;
+    private final Semaphore ttsSlots;
+    private final int asrLimit;
+    private final int ttsLimit;
+    private final long asrResultTimeoutNanos;
+    private boolean stopping;
 
-    public Gateway() {
+    public Gateway(@Value("${compat.asr-limit}") int asrLimit,
+            @Value("${compat.tts-limit}") int ttsLimit,
+            @Value("${compat.tts-idle-limit}") int ttsIdleLimit,
+            @Value("${compat.asr-result-timeout-ms}") long asrResultTimeoutMs) {
+        if (asrLimit < 1 || ttsLimit < 1 || ttsIdleLimit < 0 || asrResultTimeoutMs < 1) {
+            throw new IllegalArgumentException("Invalid compatibility capacity or timeout");
+        }
+        this.asrLimit = asrLimit;
+        this.ttsLimit = ttsLimit;
+        this.asrSlots = new Semaphore(asrLimit);
+        this.ttsSlots = new Semaphore(ttsLimit);
+        this.asrResultTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(asrResultTimeoutMs);
+        this.upstream = new OpenAi(json, commands, timers, Math.min(ttsIdleLimit, ttsLimit));
         timers.setRemoveOnCancelPolicy(true);
+    }
+
+    private static ExecutorService workers(int size, String name) {
+        return Executors.newFixedThreadPool(size, work -> worker(work, name));
+    }
+
+    private static Thread worker(Runnable work, String name) {
+        var thread = new Thread(work, name);
+        thread.setDaemon(true);
+        return thread;
     }
 
     public static void main(String[] args) {
@@ -56,8 +96,28 @@ public class Gateway implements WebSocketConfigurer {
 
     @jakarta.annotation.PreDestroy
     void shutdown() {
-        calls.values().forEach(Call::disconnect);
+        Call[] active;
+        synchronized (admission) {
+            stopping = true;
+            active = calls.values().toArray(Call[]::new);
+        }
+        CompletableFuture<Void> idleClosed = upstream.closeIdle();
+        for (Call call : active) {
+            call.disconnect();
+        }
+        try {
+            CompletableFuture.allOf(idleClosed, CompletableFuture.allOf(java.util.Arrays.stream(active)
+                    .map(call -> call.closed).toArray(CompletableFuture[]::new))).get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException error) {
+            LOG.warn("Gateway shutdown wait elapsed", error);
+        }
         timers.shutdownNow();
+        writers.shutdown();
+        closers.shutdown();
+        commands.shutdown();
+        stageLogs.shutdown();
     }
 
     @RestController
@@ -66,8 +126,10 @@ public class Gateway implements WebSocketConfigurer {
         Map<String, Object> health() {
             var events = new java.util.TreeMap<String, Long>();
             counts.forEach((name, count) -> events.put(name, count.sum()));
-            return Map.of("status", "UP", "asrActive", calls.values().stream().filter(c -> c instanceof Asr).count(),
-                    "ttsActive", calls.values().stream().filter(c -> c instanceof Tts).count(), "events", events);
+            return Map.of("status", "UP", "asrActive", asrLimit - asrSlots.availablePermits(),
+                    "ttsActive", ttsLimit - ttsSlots.availablePermits(),
+                    "asrLimit", asrLimit, "ttsLimit", ttsLimit, "ttsUpstreamIdle", upstream.idleTtsCount(),
+                    "events", events);
         }
 
         @GetMapping(value = "/", params = "Action=CreateToken")
@@ -136,16 +198,35 @@ public class Gateway implements WebSocketConfigurer {
 
         @Override
         public void afterConnectionEstablished(WebSocketSession socket) throws IOException {
-            if (!slots.tryAcquire()) {
+            Call call = admit(socket);
+            if (call == null) {
                 count("busy");
+                count(asr ? "asr_busy" : "tts_busy");
                 socket.close(new CloseStatus(1013, "Busy"));
-                return;
+            } else if (socket.isOpen()) {
+                call.receive(call::start);
+            } else {
+                call.disconnect();
             }
-            socket.setBinaryMessageSizeLimit(16_384);
-            socket.setTextMessageSizeLimit(16_384);
-            Call call = asr ? new Asr(socket) : new Tts(socket);
-            calls.put(socket.getId(), call);
-            call.start();
+        }
+
+        private Call admit(WebSocketSession socket) {
+            Semaphore slots = asr ? asrSlots : ttsSlots;
+            synchronized (admission) {
+                if (stopping || !slots.tryAcquire()) {
+                    return null;
+                }
+                try {
+                    socket.setBinaryMessageSizeLimit(16_384);
+                    socket.setTextMessageSizeLimit(16_384);
+                    Call call = asr ? new Asr(socket) : new Tts(socket);
+                    calls.put(socket.getId(), call);
+                    return call;
+                } catch (RuntimeException unavailable) {
+                    slots.release();
+                    throw unavailable;
+                }
+            }
         }
 
         @Override
@@ -186,13 +267,19 @@ public class Gateway implements WebSocketConfigurer {
         final WebSocketSession socket;
         final String label;
         final long startNanos = System.nanoTime();
+        final ClientOutput output;
+        final Semaphore slots;
+        final CompletableFuture<Void> closed = new CompletableFuture<>();
         OpenAi.Stream model;
-        ScheduledFuture<?> timeout;
-        boolean done;
+        private ScheduledFuture<?> timeout;
+        private long deadlineVersion;
+        private boolean done;
 
-        Call(WebSocketSession socket, String label) {
+        Call(WebSocketSession socket, String label, Semaphore slots) {
             this.socket = socket;
             this.label = label;
+            this.slots = slots;
+            this.output = new ClientOutput(socket, writers, closers, this::clientWriteFailed);
         }
 
         abstract void start();
@@ -207,47 +294,84 @@ public class Gateway implements WebSocketConfigurer {
             throw new IllegalArgumentException("Unexpected audio");
         }
 
-        synchronized void receive(Input input) {
-            if (!done) {
-                try {
-                    input.run();
-                } catch (Exception exception) {
-                    fail("invalid_or_unavailable");
+        void receive(Input input) {
+            synchronized (this) {
+                if (!done) {
+                    try {
+                        input.run();
+                    } catch (ClientOutput.Backpressure blocked) {
+                        clientWriteFailed();
+                    } catch (OpenAi.Backpressure blocked) {
+                        fail("model_backpressure");
+                    } catch (Exception exception) {
+                        fail("invalid_or_unavailable");
+                    }
                 }
             }
+            output.flush();
         }
 
-        void open(boolean asr, ObjectNode config) {
-            model = upstream.stream(asr, event -> receive(() -> {
-                if ("error".equals(event.path("type").asText())) {
-                    fail("model_rejected");
-                } else {
-                    event(event);
-                }
-            }), () -> fail("model_disconnected"));
-            model.open(config);
+        boolean open(boolean asr, ObjectNode config) {
+            long openingNanos = System.nanoTime();
+            model = upstream.stream(asr, event -> {
+                receive(() -> {
+                    if ("error".equals(event.path("type").asText())) {
+                        JsonNode error = event.path("error");
+                        if (acceptsModelError(error)) {
+                            if ("rate_limit_exceeded".equals(error.path("code").asText())) {
+                                count(label + "_model_rate_limited");
+                            }
+                            fail("model_rejected");
+                        }
+                    } else {
+                        event(event);
+                    }
+                });
+                return output.flushed();
+            }, () -> stage("upstream_connected", System.nanoTime() - openingNanos), this::fail);
+            return model.open(config);
+        }
+
+        boolean acceptsModelError(JsonNode error) {
+            return true;
         }
 
         void deadline(long milliseconds) {
+            deadline(TimeUnit.MILLISECONDS.toNanos(milliseconds), "timeout");
+        }
+
+        void deadline(long nanos, String reason) {
+            clearDeadline();
+            long version = deadlineVersion;
+            timeout = timers.schedule(() -> expire(version, reason), nanos, TimeUnit.NANOSECONDS);
+        }
+
+        void clearDeadline() {
+            deadlineVersion++;
             if (timeout != null) {
                 timeout.cancel(false);
+                timeout = null;
             }
-            timeout = timers.schedule(() -> fail("timeout"), milliseconds, TimeUnit.MILLISECONDS);
+        }
+
+        private synchronized void expire(long version, String reason) {
+            if (version == deadlineVersion) {
+                fail(reason);
+            }
         }
 
         void stage(String stage, long nanos) {
-            LOG.info("path={} session={} stage={} elapsed_ms={}", label, socket.getId(), stage,
-                    TimeUnit.NANOSECONDS.toMillis(nanos));
+            String sessionId = socket.getId();
+            stageLogs.execute(() -> LOG.info("path={} session={} stage={} elapsed_ms={}", label, sessionId, stage,
+                    TimeUnit.NANOSECONDS.toMillis(nanos)));
         }
 
         void send(ObjectNode message) throws IOException {
-            socket.sendMessage(new TextMessage(message.toString()));
+            output.send(message.toString());
         }
 
         void send(byte[] pcm) throws IOException {
-            if (pcm.length > 0) {
-                socket.sendMessage(new BinaryMessage(pcm));
-            }
+            output.send(pcm);
         }
 
         synchronized void fail(String reason) {
@@ -255,18 +379,29 @@ public class Gateway implements WebSocketConfigurer {
                 count(label + "_" + reason);
                 try {
                     error();
-                } catch (IOException ignored) {
-                    // The client may already have disconnected.
-                } finally {
                     end(false);
+                } catch (IOException blocked) {
+                    clientWriteFailed();
                 }
             }
         }
 
+        synchronized void clientWriteFailed() {
+            count(label + "_client_backpressure");
+            if (done) {
+                output.abort();
+            } else {
+                end(false, false);
+            }
+        }
+
         synchronized void disconnect() {
-            if (!done) {
+            if (done) {
+                // A peer can disappear after the terminal frame was queued but before its send callback.
+                output.abort();
+            } else {
                 count(label + "_disconnected");
-                end(false);
+                end(false, false);
             }
         }
 
@@ -274,40 +409,59 @@ public class Gateway implements WebSocketConfigurer {
             return null;
         }
 
+        boolean canRecycleModel() {
+            return false;
+        }
+
         void end(boolean success) {
+            end(success, true);
+        }
+
+        private void end(boolean success, boolean drain) {
             done = true;
-            if (timeout != null) {
-                timeout.cancel(false);
+            clearDeadline();
+            CompletableFuture<Void> stopped = stopModel(success);
+            if (drain) {
+                output.finish();
+            } else {
+                output.abort();
             }
-            if (model != null) {
-                model.stop(success ? null : cancel());
-            }
-            try {
-                socket.close();
-            } catch (IOException ignored) {
-                // Cleanup continues for a disconnected client.
-            } finally {
-                calls.remove(socket.getId());
+            CompletableFuture.allOf(stopped, output.closed()).whenComplete((ignored, error) -> {
+                String sessionId = socket.getId();
+                calls.remove(sessionId);
                 slots.release();
-                LOG.info("path={} session={} success={} elapsed_ms={}", label, socket.getId(), success,
-                        TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+                stageLogs.execute(() -> LOG.info("path={} session={} success={} elapsed_ms={}",
+                        label, sessionId, success, elapsedMs));
+                closed.complete(null);
+            });
+        }
+
+        private CompletableFuture<Void> stopModel(boolean success) {
+            if (model == null) {
+                return CompletableFuture.completedFuture(null);
             }
+            if (success && canRecycleModel()) {
+                return output.closed().thenCompose(ignored -> upstream.recycle(model));
+            }
+            return model.stop(success ? null : cancel());
         }
     }
 
     private final class Asr extends Call {
         private final String voiceId;
         private final AsrTurns turns;
+        private long oldestPending;
 
         Asr(WebSocketSession socket) {
-            super(socket, "asr");
+            super(socket, "asr", asrSlots);
             voiceId = (String) socket.getAttributes().get("voiceId");
             turns = new AsrTurns(json, voiceId, this::send,
                     nanos -> stage("commit_to_final", nanos));
         }
 
         @Override
-        synchronized void start() {
+        void start() {
             deadline(4400);
             var config = message("session.update");
             var session = config.putObject("session").put("type", "transcription");
@@ -323,20 +477,36 @@ public class Gateway implements WebSocketConfigurer {
             switch (event.path("type").asText()) {
                 case "session.updated", "transcription_session.updated" -> {
                     if (!turns.ready()) {
-                        timeout.cancel(false);
+                        clearDeadline();
                         send(json.createObjectNode().put("code", 0).put("voice_id", voiceId));
                         turns.start(model::send);
                         count("asr_ready");
                         stage("ready", System.nanoTime() - startNanos);
                     }
                 }
-                default -> turns.event(event);
+                default -> {
+                    turns.event(event);
+                    scheduleResultDeadline();
+                }
             }
         }
 
         @Override
         void audio(ByteBuffer data) throws IOException {
             turns.audio(data);
+            scheduleResultDeadline();
+        }
+
+        private void scheduleResultDeadline() {
+            long pending = turns.oldestPendingNanos();
+            if (pending != oldestPending) {
+                oldestPending = pending;
+                if (pending == 0) {
+                    clearDeadline();
+                } else {
+                    deadline(asrResultTimeoutNanos - (System.nanoTime() - pending), "result_timeout");
+                }
+            }
         }
 
         @Override
@@ -356,18 +526,23 @@ public class Gateway implements WebSocketConfigurer {
 
     private final class Tts extends Call {
         private final Pcm.Down pcm = new Pcm.Down();
+        private final String requestId;
         private String task;
         private String text;
         private String responseId;
+        private boolean reused;
+        private boolean correlated;
         private boolean requested;
         private boolean audible;
+        private long requestNanos;
 
         Tts(WebSocketSession socket) {
-            super(socket, "tts");
+            super(socket, "tts", ttsSlots);
+            requestId = "tts_" + socket.getId();
         }
 
         @Override
-        synchronized void start() {
+        void start() {
             deadline(3000);
         }
 
@@ -398,36 +573,82 @@ public class Gateway implements WebSocketConfigurer {
             audio.putObject("input").putNull("turn_detection");
             var out = audio.putObject("output").put("voice", "marin");
             out.putObject("format").put("type", "audio/pcm").put("rate", 24000);
-            open(false, config);
+            reused = open(false, config);
+            if (reused) {
+                count("tts_reused");
+                requestSynthesis();
+            }
+        }
+
+        private void requestSynthesis() {
+            if (requested) {
+                return;
+            }
+            stage("upstream_ready", System.nanoTime() - startNanos);
+            var command = message("response.create").put("event_id", requestId);
+            var response = command.putObject("response").put("conversation", "none")
+                    .put("instructions", "Read the following text exactly as written, in its language. "
+                            + "Speak only the given text, including all numbers.\n\n" + text);
+            response.putObject("metadata").put("compat_request", requestId);
+            response.putArray("input");
+            response.putArray("output_modalities").add("audio");
+            requested = true;
+            requestNanos = System.nanoTime();
+            model.send(command);
+        }
+
+        private void responseCreated(JsonNode response) {
+            String request = response.path("metadata").path("compat_request").asText();
+            if (requestId.equals(request)) {
+                responseId = response.path("id").asText(null);
+                correlated = responseId != null;
+            } else if (!reused && request.isEmpty() && responseId == null) {
+                responseId = response.path("id").asText(null);
+            }
+        }
+
+        private boolean isCurrentResponse(String id) {
+            if (!id.isEmpty()) {
+                return id.equals(responseId);
+            }
+            // A legacy upstream may omit identifiers. It can serve one task on a cold connection.
+            correlated = false;
+            return !reused;
+        }
+
+        @Override
+        boolean acceptsModelError(JsonNode error) {
+            String eventId = error.path("event_id").asText();
+            return !reused || eventId.isEmpty() || requestId.equals(eventId);
         }
 
         @Override
         void event(JsonNode event) throws IOException {
             switch (event.path("type").asText()) {
-                case "session.updated" -> {
-                    if (!requested) {
-                        var command = message("response.create");
-                        var response = command.putObject("response").put("conversation", "none")
-                                .put("instructions", "Read the following text exactly as written, in its language. "
-                                        + "Speak only the given text, including all numbers.\n\n" + text);
-                        response.putArray("input");
-                        response.putArray("output_modalities").add("audio");
-                        requested = true;
-                        model.send(command);
-                    }
-                }
-                case "response.created" -> responseId = event.path("response").path("id").asText(null);
+                case "session.updated" -> requestSynthesis();
+                case "response.created" -> responseCreated(event.path("response"));
                 case "response.output_audio.delta" -> {
+                    if (!isCurrentResponse(event.path("response_id").asText())) {
+                        return;
+                    }
                     byte[] converted = pcm.append(java.util.Base64.getDecoder().decode(event.path("delta").asText()));
                     if (converted.length > 0 && !audible) {
                         count("tts_first_audio");
                         stage("first_pcm", System.nanoTime() - startNanos);
+                        stage("response_to_first_pcm", System.nanoTime() - requestNanos);
                         audible = true;
+                        send(converted);
+                        output.flushed().thenRun(() -> stage("first_pcm_sent", System.nanoTime() - startNanos));
+                    } else {
+                        send(converted);
                     }
-                    send(converted);
                 }
                 case "response.done" -> {
-                    if (!"completed".equals(event.path("response").path("status").asText()) || !audible) {
+                    JsonNode response = event.path("response");
+                    if (!isCurrentResponse(response.path("id").asText())) {
+                        return;
+                    }
+                    if (!"completed".equals(response.path("status").asText()) || !audible) {
                         fail("incomplete");
                         return;
                     }
@@ -438,6 +659,11 @@ public class Gateway implements WebSocketConfigurer {
                 }
                 default -> { }
             }
+        }
+
+        @Override
+        boolean canRecycleModel() {
+            return correlated;
         }
 
         @Override
