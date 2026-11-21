@@ -305,14 +305,15 @@ def test_tts_reuse(port, fixture):
         print("idle upstream connection expired and drained", flush=True)
 
 
-def launch(stack, args, fixture, idle_limit, log_name):
+def launch(stack, args, fixture, idle_limit, log_name, extra_env=None):
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
     env = {**os.environ, **ENV, "COMPAT_PORT": str(port),
            "COMPAT_REALTIME_URL": f"ws://127.0.0.1:{fixture.server_port}/v1/realtime",
            "COMPAT_ASR_LIMIT": str(ASR_LIMIT), "COMPAT_TTS_LIMIT": str(TTS_LIMIT),
-           "COMPAT_TTS_IDLE_LIMIT": str(idle_limit), "COMPAT_ASR_RESULT_TIMEOUT_MS": "1000"}
+           "COMPAT_TTS_IDLE_LIMIT": str(idle_limit), "COMPAT_ASR_RESULT_TIMEOUT_MS": "1000",
+           **(extra_env or {})}
     route_tools["child"](stack, ["java", "-jar", str(args.compat_jar.resolve())],
                          env, args.output_dir / log_name, port)
     return port

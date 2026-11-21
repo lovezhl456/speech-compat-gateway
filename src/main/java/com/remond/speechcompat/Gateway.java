@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.server.ServerHttpRequest;
@@ -42,6 +43,7 @@ import org.springframework.web.socket.server.HandshakeInterceptor;
 
 @SpringBootApplication
 @EnableWebSocket
+@EnableConfigurationProperties(TtsTimeouts.class)
 public class Gateway implements WebSocketConfigurer {
     private static final Logger LOG = LoggerFactory.getLogger(Gateway.class);
     private final ObjectMapper json = new ObjectMapper();
@@ -62,12 +64,14 @@ public class Gateway implements WebSocketConfigurer {
     private final int asrLimit;
     private final int ttsLimit;
     private final long asrResultTimeoutNanos;
+    private final TtsTimeouts ttsTimeouts;
     private boolean stopping;
 
     public Gateway(@Value("${compat.asr-limit}") int asrLimit,
             @Value("${compat.tts-limit}") int ttsLimit,
             @Value("${compat.tts-idle-limit}") int ttsIdleLimit,
-            @Value("${compat.asr-result-timeout-ms}") long asrResultTimeoutMs) {
+            @Value("${compat.asr-result-timeout-ms}") long asrResultTimeoutMs,
+            TtsTimeouts ttsTimeouts) {
         if (asrLimit < 1 || ttsLimit < 1 || ttsIdleLimit < 0 || asrResultTimeoutMs < 1) {
             throw new IllegalArgumentException("Invalid compatibility capacity or timeout");
         }
@@ -76,6 +80,7 @@ public class Gateway implements WebSocketConfigurer {
         this.asrSlots = new Semaphore(asrLimit);
         this.ttsSlots = new Semaphore(ttsLimit);
         this.asrResultTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(asrResultTimeoutMs);
+        this.ttsTimeouts = ttsTimeouts;
         this.upstream = new OpenAi(json, commands, timers, Math.min(ttsIdleLimit, ttsLimit));
         timers.setRemoveOnCancelPolicy(true);
     }
@@ -327,9 +332,13 @@ public class Gateway implements WebSocketConfigurer {
                         event(event);
                     }
                 });
-                return output.flushed();
+                return modelEventFlushed();
             }, () -> stage("upstream_connected", System.nanoTime() - openingNanos), this::fail);
             return model.open(config);
+        }
+
+        CompletableFuture<Void> modelEventFlushed() {
+            return output.flushed();
         }
 
         boolean acceptsModelError(JsonNode error) {
@@ -341,6 +350,9 @@ public class Gateway implements WebSocketConfigurer {
         }
 
         void deadline(long nanos, String reason) {
+            if (done) {
+                return;
+            }
             clearDeadline();
             long version = deadlineVersion;
             timeout = timers.schedule(() -> expire(version, reason), nanos, TimeUnit.NANOSECONDS);
@@ -534,6 +546,8 @@ public class Gateway implements WebSocketConfigurer {
         private boolean correlated;
         private boolean requested;
         private boolean audible;
+        private boolean writingAudio;
+        private long synthesisNanos;
         private long requestNanos;
 
         Tts(WebSocketSession socket) {
@@ -565,7 +579,8 @@ public class Gateway implements WebSocketConfigurer {
                 throw new IllegalArgumentException("Unsupported synthesis settings");
             }
             text = input;
-            deadline(10_500);
+            synthesisNanos = System.nanoTime();
+            synthesisDeadline(ttsTimeouts.readyMs(), "ready_timeout");
             var config = message("session.update");
             var session = config.putObject("session").put("type", "realtime");
             session.putArray("output_modalities").add("audio");
@@ -594,7 +609,33 @@ public class Gateway implements WebSocketConfigurer {
             response.putArray("output_modalities").add("audio");
             requested = true;
             requestNanos = System.nanoTime();
+            synthesisDeadline(ttsTimeouts.firstAudioMs(), "first_audio_timeout");
             model.send(command);
+        }
+
+        private long remainingSynthesisNanos() {
+            return TimeUnit.MILLISECONDS.toNanos(ttsTimeouts.totalMs()) - (System.nanoTime() - synthesisNanos);
+        }
+
+        private void synthesisDeadline(long stageMs, String reason) {
+            long remaining = remainingSynthesisNanos();
+            long stage = TimeUnit.MILLISECONDS.toNanos(stageMs);
+            if (stage < remaining) {
+                deadline(stage, reason);
+            } else {
+                deadline(remaining, "total_timeout");
+            }
+        }
+
+        @Override
+        synchronized CompletableFuture<Void> modelEventFlushed() {
+            var flushed = super.modelEventFlushed();
+            return writingAudio ? flushed.thenRun(this::awaitNextAudio) : flushed;
+        }
+
+        private synchronized void awaitNextAudio() {
+            writingAudio = false;
+            synthesisDeadline(ttsTimeouts.audioIdleMs(), "audio_idle_timeout");
         }
 
         private void responseCreated(JsonNode response) {
@@ -632,15 +673,22 @@ public class Gateway implements WebSocketConfigurer {
                         return;
                     }
                     byte[] converted = pcm.append(java.util.Base64.getDecoder().decode(event.path("delta").asText()));
-                    if (converted.length > 0 && !audible) {
+                    if (converted.length == 0) {
+                        return;
+                    }
+                    boolean first = !audible;
+                    if (first) {
                         count("tts_first_audio");
                         stage("first_pcm", System.nanoTime() - startNanos);
                         stage("response_to_first_pcm", System.nanoTime() - requestNanos);
                         audible = true;
-                        send(converted);
+                    }
+                    send(converted);
+                    // No next upstream event is requested until this write completes.
+                    writingAudio = true;
+                    deadline(remainingSynthesisNanos(), "total_timeout");
+                    if (first) {
                         output.flushed().thenRun(() -> stage("first_pcm_sent", System.nanoTime() - startNanos));
-                    } else {
-                        send(converted);
                     }
                 }
                 case "response.done" -> {
