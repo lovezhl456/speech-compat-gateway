@@ -39,6 +39,7 @@ route_tools = runpy.run_path(str(SITE / "compat-routes.py"))
 settings = runpy.run_path(str(ROOT / "scripts/start.py"))
 echo = runpy.run_path(str(SITE / "business-echo.py"))
 KEY = "fixture-openai-key"
+LONG_TTS_TAIL = 2450
 
 
 class OpenAiFixture(LiveClientFixture):
@@ -156,6 +157,17 @@ class OpenAiFixture(LiveClientFixture):
             assert cancelled.get("response_id") == result["id"]
             count("model_cancels")
             return False
+        if getattr(self.server, "extend_next_tts", False):
+            self.server.extend_next_tts = False
+            for frame in range(125):
+                marker = LONG_TTS_TAIL if frame == 124 else 1650
+                pcm = tone_frame(frequency if frame < 115 else marker)
+                self.event({"type": "response.output_audio.delta", "response_id": result["id"],
+                            "delta": base64.b64encode(pcm).decode()})
+                time.sleep(0.1)
+            self.event({"type": "response.done", "response": {**result, "status": "completed"}})
+            count("model_tts_finished")
+            return True
         frames = 30
         pcm = tone_frame(frequency) * frames
         for offset in range(0, len(pcm), 2999):
@@ -231,7 +243,7 @@ def test_suite(switch_port, fixture, by_route, port, faults_only=False):
             call.speak()
             heard(call, 3)
         wait_until(drained, "sessions remained open", 4)
-        assert COUNTS["model_commits"] == before + 2
+        assert COUNTS["model_commits"] == before + 2, (codec, before, COUNTS["model_commits"])
         print(f"9910 {codec}: silence, ordered duplicate suppression and two responses", flush=True)
 
     fixture.fail_next_tts = True
@@ -349,11 +361,34 @@ def start_switch(stack, routes, ports, run):
                                stdin=subprocess.PIPE, stdout=console, stderr=subprocess.STDOUT)
     stack.callback(route_tools["stop"], process)
     def ready():
-        status = subprocess.run(["fs_cli", "-H", "127.0.0.1", "-P", str(event), "-p", password,
-                                 "-x", "sofia status"], capture_output=True, text=True, timeout=2)
+        try:
+            status = subprocess.run(["fs_cli", "-H", "127.0.0.1", "-P", str(event), "-p", password,
+                                     "-x", "sofia status"], capture_output=True, text=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            return False
         return all(f"127.0.0.1:{port}" in status.stdout for port in (browser, telephone))
-    wait_until(ready, "isolated FreeSWITCH failed to start", 15)
+    wait_until(ready, "isolated FreeSWITCH failed to start", 30)
     return browser
+
+
+def test_long_tts(switch_port, fixture, routes, compat_port):
+    fixture.single_response = True
+    for extension in ("9910", "9913"):
+        completed = health(compat_port)["events"].get("tts_completed", 0)
+        fixture.extend_next_tts = True
+        target = switch_port or routes[extension][1]
+        with Phone(("127.0.0.1", target), extension) as call:
+            call.speak()
+            tones = call.hear(19, frequency=LONG_TTS_TAIL, frames=1)
+            tail = sum(abs(tone - 1650) <= 100 for tone in tones)
+            assert (len(tones) >= 90 and tail >= 8 and abs(tones[-1] - LONG_TTS_TAIL) <= 100), (
+                extension, len(tones), tail, tones[-5:])
+            wait_until(lambda: health(compat_port)["events"].get("tts_completed", 0) == completed + 1,
+                       "long task did not complete normally", 3)
+        wait_until(lambda: no_active(compat_port), "long call left active resources", 5)
+        assert not sessions(f"http://127.0.0.1:{routes[extension][2]}")
+        print(f"{extension} long TTS: {len(tones)} voiced RTP frames observed through final tone, normal completion",
+              flush=True)
 
 
 def main():
@@ -361,8 +396,10 @@ def main():
     parser.add_argument("--through-switch", action="store_true")
     parser.add_argument("--ephemeral", action="store_true", help="use separate ports for direct SIP tests")
     parser.add_argument("--faults-only", action="store_true")
+    parser.add_argument("--long-tts", action="store_true", help="also verify 12.5-second continuous synthesis")
     parser.add_argument("--serve", action="store_true", help="hold fixture-backed routes for UI checks")
     parser.add_argument("--compat-jar", type=Path, default=ROOT / "target/speech-compat-gateway-0.1.0-SNAPSHOT.jar")
+    parser.add_argument("--media-jar", type=Path, default=MEDIA / "target/mjsip-media-gateway-0.1.0-SNAPSHOT.jar")
     parser.add_argument("--output-dir", type=Path, help="save logs separately from the default test run")
     args = parser.parse_args()
     routes = route_tools["ROUTES"]
@@ -385,7 +422,6 @@ def main():
     prep([compat_port] + [port for _, _, port, _ in routes.values()],
          [port for _, sip, _, rtp in routes.values() for port in (sip, *range(rtp, rtp + 40))])
     local = {name: value.replace(":18120", f":{compat_port}") for name, value in settings["local_settings"]().items()}
-    media_jar = MEDIA / "target/mjsip-media-gateway-0.1.0-SNAPSHOT.jar"
     run = args.output_dir or ROOT / ".local" / (
         "test-browser" if args.serve else "test-bridge" if args.through_switch else "test-direct"
     )
@@ -414,7 +450,9 @@ def main():
                    "SPEECH_API_BASE": f"http://127.0.0.1:{fixture.server_port}/v1",
                    "SPEECH_REPLY_RPC_BASE": f"http://127.0.0.1:{server.server_port}",
                    "SPEECH_REPLY_RPC_TOKEN": ""}
-            child(stack, ["java", "-jar", str(media_jar)], env, run / (route + ".log"), http)
+            if route == "9913":
+                env["ALIYUN_NLS_SYNTHESIS_TIMEOUT_MS"] = str(settings["client_tts_timeout_ms"]())
+            child(stack, ["java", "-jar", str(args.media_jar.resolve())], env, run / (route + ".log"), http)
         print(f"fixture routes ready; logs {run}", flush=True)
         if args.serve:
             fixture.order_recognition = True
@@ -425,6 +463,8 @@ def main():
         else:
             switch_port = start_switch(stack, routes, switch_ports, run) if switch_ports else (15060 if args.through_switch else None)
             test_suite(switch_port, fixture, routes, compat_port, args.faults_only)
+            if args.long_tts:
+                test_long_tts(switch_port, fixture, routes, compat_port)
 
 
 if __name__ == "__main__":

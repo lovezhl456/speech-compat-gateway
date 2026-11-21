@@ -64,6 +64,12 @@ def local_settings():
     return result
 
 
+def client_tts_timeout_ms():
+    total = int(os.environ.get("COMPAT_TTS_TOTAL_TIMEOUT_MS", "30000"))
+    # Leave time for the compatible endpoint to deliver the terminal event.
+    return max(12_000, total + 2_000)
+
+
 def main():
     jar = ROOT / "target" / "speech-compat-gateway-0.1.0-SNAPSHOT.jar"
     if not jar.is_file():
