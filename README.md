@@ -99,3 +99,7 @@ TTS 客户端在 WebSocket 建立后有 3 秒提交 `StartSynthesis`。有效请
 下游写入期间仍执行独立的发送限制和合成总时限。超时返回原有的 `TaskFailed`，阶段原因可在 `/healthz` 的 `tts_ready_timeout`、`tts_first_audio_timeout`、`tts_audio_idle_timeout`、`tts_total_timeout` 计数中查看。调整总时限时，启动 18120 和拨测服务使用相同的 `COMPAT_TTS_TOTAL_TIMEOUT_MS`，使 9913 的单句等待能覆盖上游期限和终止事件。
 
 TTS 只保留正常结束、能够校验响应归属的上游连接。每条连接一次服务一个任务，空闲 30 秒回收，取消或失败后关闭。默认最多保留 4 条，可通过 `COMPAT_TTS_IDLE_LIMIT` 调整，设为 0 时每个任务新建上游连接。连接复用不会提前发起合成请求。
+
+## 许可证
+
+本仓库自有代码和文档采用 [Apache License 2.0](LICENSE)。
