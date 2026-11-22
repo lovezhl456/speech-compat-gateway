@@ -304,11 +304,21 @@ final class OpenAi {
                     } else {
                         input.setLength(0);
                     }
-                    Receiver target = receiver;
+                    boolean modelError = "error".equals(event.path("type").asText());
+                    Receiver target;
+                    boolean evictIdle;
+                    synchronized (this) {
+                        target = receiver;
+                        evictIdle = target == null && modelError && !failed && !stopped;
+                        if (evictIdle) {
+                            // A borrower must see this failure even before the pool removes the entry.
+                            failed = true;
+                        }
+                    }
                     if (target == null) {
-                        if ("error".equals(event.path("type").asText())) {
-                            failed("model_idle_error");
-                        } else if (!stopped) {
+                        if (evictIdle) {
+                            commands.execute(() -> evictFailed(this));
+                        } else if (!modelError && !stopped) {
                             ws.request(1);
                         }
                         return null;

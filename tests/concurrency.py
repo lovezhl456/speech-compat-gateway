@@ -123,6 +123,7 @@ class FixtureServer(ThreadingHTTPServer):
     slow_tasks = 0
     stall_result = False
     tts_barrier = None
+    next_tts_error = None
 
 
 class Fixture(OpenAiFixture):
@@ -130,6 +131,18 @@ class Fixture(OpenAiFixture):
         barrier = self.server.tts_barrier
         if barrier is not None:
             barrier.wait(6)
+        failure = self.server.next_tts_error
+        if failure is not None:
+            self.server.next_tts_error = None
+            assert previous is not None, "lease error test must reuse the existing connection"
+            error = {"code": "fixture_rejected"}
+            if failure == "old":
+                error["event_id"] = previous["metadata"]["compat_request"]
+            elif failure == "current":
+                error["event_id"] = command["event_id"]
+            self.event({"type": "error", "error": error})
+            if failure != "old":
+                return False
         return super().render_tts(command, result, previous)
 
     def synthesize_model(self):
@@ -280,6 +293,7 @@ def test_tts_reuse(port, fixture):
             assert health(port)["ttsUpstreamIdle"] == 1
 
         synthesize(800)
+        fixture.next_tts_error = "old"
         synthesize(1100)
         assert COUNTS["model_tts_connections"] == before + 1
         assert health(port)["events"]["tts_reused"] == 1
@@ -296,13 +310,28 @@ def test_tts_reuse(port, fixture):
         assert health(port)["ttsUpstreamIdle"] == 0
         synthesize(1600)
         assert COUNTS["model_tts_connections"] == before + 2
-        print("2 completed tasks used 1 connection, delayed output discarded, cancelled lease retired", flush=True)
+        print("2 completed tasks reused 1 connection, old correlated error/output discarded, cancelled lease retired",
+              flush=True)
 
         idle_at = time.monotonic()
         wait_until(lambda: no_active(port) and health(port)["ttsUpstreamIdle"] == 0,
                    "the idle connection did not expire", 34)
         assert time.monotonic() - idle_at >= 28
         print("idle upstream connection expired and drained", flush=True)
+
+        for category in ("current", "uncorrelated"):
+            synthesize(1600)
+            rejected = health(port)["events"].get("tts_model_rejected", 0)
+            fixture.next_tts_error = category
+            peer = Peer(port, tts_path())
+            stack.callback(peer.close)
+            peer.start_tts()
+            assert peer.event()["header"]["name"] == "TaskFailed"
+            assert peer.close_code() == 1000
+            wait_until(lambda: no_active(port) and health(port)["ttsUpstreamIdle"] == 0,
+                       f"{category} model error did not retire the lease", 5)
+            assert health(port)["events"]["tts_model_rejected"] == rejected + 1
+        print("current and uncorrelated upstream errors still fail the reused task", flush=True)
 
 
 def launch(stack, args, fixture, idle_limit, log_name, extra_env=None):
