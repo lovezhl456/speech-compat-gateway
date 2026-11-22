@@ -53,8 +53,8 @@ final class ClientOutput {
         remote.setSendTimeout(SEND_TIMEOUT_MS);
     }
 
-    void send(String text) throws Backpressure {
-        enqueue(text, null, text.length() * 3);
+    CompletableFuture<Void> send(String text) throws Backpressure {
+        return enqueue(text, null, text.length() * 3);
     }
 
     void send(byte[] audio) throws Backpressure {
@@ -63,12 +63,15 @@ final class ClientOutput {
         }
     }
 
-    private synchronized void enqueue(String text, byte[] audio, int size) throws Backpressure {
+    private synchronized CompletableFuture<Void> enqueue(String text, byte[] audio, int size)
+            throws Backpressure {
         if (finishing || pending.size() >= MAX_FRAMES || size > MAX_BYTES - bytes) {
             throw new Backpressure();
         }
-        pending.addLast(new Frame(text, audio, size, System.nanoTime(), new CompletableFuture<>()));
+        var sent = new CompletableFuture<Void>();
+        pending.addLast(new Frame(text, audio, size, System.nanoTime(), sent));
         bytes += size;
+        return sent;
     }
 
     void flush() {

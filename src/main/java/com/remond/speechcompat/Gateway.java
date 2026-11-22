@@ -378,8 +378,8 @@ public class Gateway implements WebSocketConfigurer {
                     TimeUnit.NANOSECONDS.toMillis(nanos)));
         }
 
-        void send(ObjectNode message) throws IOException {
-            output.send(message.toString());
+        CompletableFuture<Void> send(ObjectNode message) throws IOException {
+            return output.send(message.toString());
         }
 
         void send(byte[] pcm) throws IOException {
@@ -429,32 +429,45 @@ public class Gateway implements WebSocketConfigurer {
             end(success, true);
         }
 
+        void endAfterTtsCompletion(CompletableFuture<Void> terminalWrite) {
+            end(true, true, terminalWrite.handle((ignored, error) -> {
+                if (error == null) {
+                    count("tts_completed");
+                }
+                return error == null;
+            }));
+        }
+
         private void end(boolean success, boolean drain) {
+            end(success, drain, CompletableFuture.completedFuture(success));
+        }
+
+        private void end(boolean success, boolean drain, CompletableFuture<Boolean> delivered) {
             done = true;
             clearDeadline();
-            CompletableFuture<Void> stopped = stopModel(success);
+            CompletableFuture<Void> stopped = stopModel(success, delivered);
             if (drain) {
                 output.finish();
             } else {
                 output.abort();
             }
-            CompletableFuture.allOf(stopped, output.closed()).whenComplete((ignored, error) -> {
+            CompletableFuture.allOf(stopped, output.closed(), delivered).whenComplete((ignored, error) -> {
                 String sessionId = socket.getId();
                 calls.remove(sessionId);
                 slots.release();
                 long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
                 stageLogs.execute(() -> LOG.info("path={} session={} success={} elapsed_ms={}",
-                        label, sessionId, success, elapsedMs));
+                        label, sessionId, delivered.getNow(false), elapsedMs));
                 closed.complete(null);
             });
         }
 
-        private CompletableFuture<Void> stopModel(boolean success) {
+        private CompletableFuture<Void> stopModel(boolean success, CompletableFuture<Boolean> delivered) {
             if (model == null) {
                 return CompletableFuture.completedFuture(null);
             }
             if (success && canRecycleModel()) {
-                return output.closed().thenCompose(ignored -> upstream.recycle(model));
+                return upstream.finishTts(model, delivered, output.closed());
             }
             return model.stop(success ? null : cancel());
         }
@@ -701,9 +714,7 @@ public class Gateway implements WebSocketConfigurer {
                         return;
                     }
                     send(pcm.finish());
-                    send(nls("SynthesisCompleted", 20000000));
-                    count("tts_completed");
-                    end(true);
+                    endAfterTtsCompletion(send(nls("SynthesisCompleted", 20000000)));
                 }
                 default -> { }
             }

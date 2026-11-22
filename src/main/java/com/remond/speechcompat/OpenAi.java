@@ -15,7 +15,6 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -70,8 +69,8 @@ final class OpenAi {
                 Stream stream = idleTts.removeLast();
                 stream.idleExpiry.cancel(false);
                 stream.idleExpiry = null;
-                if (stream.usable() && System.nanoTime() - stream.idleSince < TimeUnit.SECONDS.toNanos(IDLE_TTS_SECONDS)) {
-                    stream.receiver = receiver;
+                if (System.nanoTime() - stream.idleSince < TimeUnit.SECONDS.toNanos(IDLE_TTS_SECONDS)
+                        && stream.borrow(receiver)) {
                     return stream;
                 }
                 stream.stop(null);
@@ -80,11 +79,16 @@ final class OpenAi {
         return new Stream(asr ? TRANSCRIPTION : SYNTHESIS, receiver);
     }
 
-    synchronized CompletableFuture<Void> recycle(Stream stream) {
-        if (stopping || idleTts.size() >= idleLimit || !stream.usable()) {
+    CompletableFuture<Void> finishTts(Stream stream, CompletableFuture<Boolean> delivered,
+            CompletableFuture<Void> clientClosed) {
+        return delivered.thenCombine(clientClosed, (sent, ignored) -> sent)
+                .thenCompose(sent -> sent ? recycle(stream) : stream.stop(null));
+    }
+
+    private synchronized CompletableFuture<Void> recycle(Stream stream) {
+        if (stopping || idleTts.size() >= idleLimit || !stream.park()) {
             return stream.stop(null);
         }
-        stream.receiver = null;
         long since = System.nanoTime();
         stream.idleSince = since;
         stream.idleExpiry = timers.schedule(() -> evict(stream, since), IDLE_TTS_SECONDS, TimeUnit.SECONDS);
@@ -98,10 +102,20 @@ final class OpenAi {
 
     private synchronized void evict(Stream stream, long idleSince) {
         if (stream.idleSince == idleSince && idleTts.remove(stream)) {
-            stream.idleExpiry.cancel(false);
-            stream.idleExpiry = null;
-            stream.stop(null);
+            closeParked(stream);
         }
+    }
+
+    private synchronized void evictFailed(Stream stream) {
+        if (idleTts.remove(stream)) {
+            closeParked(stream);
+        }
+    }
+
+    private void closeParked(Stream stream) {
+        stream.idleExpiry.cancel(false);
+        stream.idleExpiry = null;
+        stream.stop(null);
     }
 
     synchronized CompletableFuture<Void> closeIdle() {
@@ -121,7 +135,7 @@ final class OpenAi {
         private static final long SEND_TIMEOUT_MS = 2000;
         private final String query;
         private volatile Receiver receiver;
-        private final AtomicBoolean failed = new AtomicBoolean();
+        private boolean failed;
         private StringBuilder input = new StringBuilder();
         private CompletableFuture<WebSocket> opening;
         private CompletableFuture<WebSocket> outbound;
@@ -157,8 +171,24 @@ final class OpenAi {
             return false;
         }
 
-        private synchronized boolean usable() {
-            return System.nanoTime() - openedAt < MAX_TTS_AGE_NANOS && !failed.get() && !stopped
+        private synchronized boolean borrow(Receiver next) {
+            if (receiver != null || !usable()) {
+                return false;
+            }
+            receiver = next;
+            return true;
+        }
+
+        private synchronized boolean park() {
+            if (!usable()) {
+                return false;
+            }
+            receiver = null;
+            return true;
+        }
+
+        private boolean usable() {
+            return System.nanoTime() - openedAt < MAX_TTS_AGE_NANOS && !failed && !stopped
                     && socket != null && !socket.isInputClosed() && !socket.isOutputClosed()
                     && outbound.isDone() && !outbound.isCompletedExceptionally();
         }
@@ -223,16 +253,25 @@ final class OpenAi {
         }
 
         private void failed(String reason) {
-            if (!stopped && failed.compareAndSet(false, true)) {
-                commands.execute(() -> {
-                    Receiver target = receiver;
-                    if (!stopped && target != null) {
-                        target.failure().accept(reason);
-                    } else {
-                        evict(this, idleSince);
-                    }
-                });
+            failed(reason, null);
+        }
+
+        private void failed(String reason, Receiver owner) {
+            Receiver target;
+            synchronized (this) {
+                if (stopped || failed || (owner != null && owner != receiver)) {
+                    return;
+                }
+                failed = true;
+                target = receiver;
             }
+            commands.execute(() -> {
+                if (target == null) {
+                    evictFailed(this);
+                } else if (!stopped) {
+                    target.failure().accept(reason);
+                }
+            });
         }
 
         @Override
@@ -276,7 +315,7 @@ final class OpenAi {
                     }
                     target.events().apply(event).whenComplete((ignored, error) -> {
                         if (error != null) {
-                            failed("client_write_failed");
+                            failed("client_write_failed", target);
                         } else if (!stopped) {
                             ws.request(1);
                         }
