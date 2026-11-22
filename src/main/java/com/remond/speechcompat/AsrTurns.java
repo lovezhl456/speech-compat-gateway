@@ -14,6 +14,8 @@ import java.util.function.Consumer;
 
 final class AsrTurns {
     private static final int MAX_PENDING = 8;
+    private static final int FRAME_MS = 20;
+    private static final int MIN_VOICED_BYTES = 5 * Pcm.FRAME_BYTES;
     private final ObjectMapper json;
     private final String voiceId;
     private final Deliver deliver;
@@ -56,16 +58,29 @@ final class AsrTurns {
             data.get(frame, offset, count);
             offset += count;
             if (offset == frame.length) {
-                process();
-                clock += 20;
+                process(frame.length);
+                clock += FRAME_MS;
                 offset = 0;
             }
         }
         flushAudio();
     }
 
-    private void process() throws IOException {
-        boolean speech = Pcm.speech(frame);
+    void finishInput() throws IOException {
+        if ((offset & 1) != 0) {
+            throw new IllegalArgumentException("Incomplete input PCM sample");
+        }
+        if (offset != 0) {
+            process(offset);
+            offset = 0;
+        }
+        if (current != null) {
+            finish();
+        }
+    }
+
+    private void process(int length) throws IOException {
+        boolean speech = Pcm.speech(frame, length);
         if (current == null) {
             if (!speech) {
                 return;
@@ -73,12 +88,13 @@ final class AsrTurns {
             current = new Turn(index++, clock);
             deliver.send(result(current, 0, ""));
         }
+        long end = clock + (long) length * FRAME_MS / frame.length;
         if (speech) {
-            current.lastVoice = clock + 20;
-            current.voiced += 20;
+            current.lastVoice = end;
+            current.voicedBytes += length;
         }
-        current.audio.writeBytes(Pcm.up(frame));
-        if (clock + 20 - current.lastVoice >= 700 || clock + 20 - current.start >= 25_000) {
+        current.audio.writeBytes(Pcm.up(frame, length));
+        if (end - current.lastVoice >= 700 || end - current.start >= 25_000) {
             finish();
         }
     }
@@ -95,7 +111,7 @@ final class AsrTurns {
         flushAudio();
         Turn turn = current;
         current = null;
-        if (turn.voiced < 100) {
+        if (turn.voicedBytes < MIN_VOICED_BYTES) {
             send.accept(message("input_audio_buffer.clear"));
             deliver.send(result(turn, 2, ""));
         } else {
@@ -178,7 +194,7 @@ final class AsrTurns {
         final StringBuilder partial = new StringBuilder();
         final java.io.ByteArrayOutputStream audio = new java.io.ByteArrayOutputStream();
         long lastVoice;
-        int voiced;
+        int voicedBytes;
         long committedNanos;
 
         Turn(int index, long start) {

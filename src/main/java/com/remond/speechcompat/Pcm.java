@@ -5,20 +5,20 @@ import java.io.ByteArrayOutputStream;
 final class Pcm {
     static final int FRAME_BYTES = 320;
 
-    static boolean speech(byte[] frame) {
+    static boolean speech(byte[] frame, int length) {
         long energy = 0;
-        for (int i = 0; i < frame.length; i += 2) {
+        for (int i = 0; i < length; i += 2) {
             int sample = sample(frame[i], frame[i + 1]);
             energy += (long) sample * sample;
         }
-        return energy >= 400L * 400 * (frame.length / 2);
+        return energy >= 400L * 400 * (length / 2);
     }
 
-    static byte[] up(byte[] frame) {
-        byte[] result = new byte[frame.length * 3];
-        for (int i = 0; i < frame.length; i += 2) {
+    static byte[] up(byte[] frame, int length) {
+        byte[] result = new byte[length * 3];
+        for (int i = 0; i < length; i += 2) {
             int a = sample(frame[i], frame[i + 1]);
-            int b = i + 2 < frame.length ? sample(frame[i + 2], frame[i + 3]) : a;
+            int b = i + 2 < length ? sample(frame[i + 2], frame[i + 3]) : a;
             for (int j = 0; j < 3; j++) {
                 write(result, i * 3 + j * 2, (a * (3 - j) + b * j) / 3);
             }

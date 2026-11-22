@@ -477,6 +477,7 @@ public class Gateway implements WebSocketConfigurer {
         private final String voiceId;
         private final AsrTurns turns;
         private long oldestPending;
+        private boolean inputEnded;
 
         Asr(WebSocketSession socket) {
             super(socket, "asr", asrSlots);
@@ -507,23 +508,37 @@ public class Gateway implements WebSocketConfigurer {
                         turns.start(model::send);
                         count("asr_ready");
                         stage("ready", System.nanoTime() - startNanos);
+                        if (inputEnded) {
+                            finishOrAwaitResults();
+                        }
                     }
                 }
                 default -> {
                     turns.event(event);
-                    scheduleResultDeadline();
+                    finishOrAwaitResults();
                 }
             }
         }
 
         @Override
         void audio(ByteBuffer data) throws IOException {
+            if (inputEnded) {
+                throw new IllegalArgumentException("Audio received after end");
+            }
             turns.audio(data);
-            scheduleResultDeadline();
+            finishOrAwaitResults();
         }
 
-        private void scheduleResultDeadline() {
+        private void finishOrAwaitResults() throws IOException {
+            if (!turns.ready()) {
+                return;
+            }
             long pending = turns.oldestPendingNanos();
+            if (inputEnded && pending == 0) {
+                send(json.createObjectNode().put("code", 0).put("voice_id", voiceId).put("final", 1));
+                end(true);
+                return;
+            }
             if (pending != oldestPending) {
                 oldestPending = pending;
                 if (pending == 0) {
@@ -539,8 +554,14 @@ public class Gateway implements WebSocketConfigurer {
             if (!"end".equals(data.path("type").asText())) {
                 throw new IllegalArgumentException("Expected end");
             }
-            send(json.createObjectNode().put("code", 0).put("voice_id", voiceId).put("final", 1));
-            end(true);
+            if (inputEnded) {
+                return;
+            }
+            inputEnded = true;
+            if (turns.ready()) {
+                turns.finishInput();
+                finishOrAwaitResults();
+            }
         }
 
         @Override

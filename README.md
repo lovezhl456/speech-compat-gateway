@@ -73,6 +73,7 @@ sequenceDiagram
 [查看本轮验收结果与录音](ACCEPTANCE.md)。
 
 - `tests/media.py --ephemeral` 用实际 SDK 和 SIP/RTP 直连测试本机 OpenAI 夹具。
+- `python3 tests/asr_end.py` 用本地 WebSocket 夹具验证停止上传后提交尾句、等待已上传音频的稳态结果、发送成功终态以及错误时回收连接。
 - `tests/media.py --ephemeral --through-switch` 另起隔离 FreeSWITCH，跑同一组桥接用例。
 - 两种电话测试均可加 `--long-tts`，验证 9910 和 9913 收到持续合成约 12.5 秒的任务尾音。可用 `--media-jar` 指定语音中控制品。
 - `tests/tts_timeouts.py --compat-jar JAR --output-dir DIR` 核对长任务的完整 PCM、阶段超时、慢读、断开和复用旧事件。
