@@ -32,18 +32,22 @@ final class OpenAi {
     private final Executor commands;
     private final ScheduledExecutorService timers;
     private final int idleLimit;
+    private final Duration ttsConnectBudget;
+    private static final Duration ASR_CONNECT_BUDGET = Duration.ofSeconds(4);
     private final ArrayDeque<Stream> idleTts = new ArrayDeque<>();
     private boolean stopping;
     private final String key = Auth.setting("OPENAI_API_KEY");
     private final String endpoint = System.getenv().getOrDefault("COMPAT_REALTIME_URL",
             "wss://api.openai.com/v1/realtime");
 
-    OpenAi(ObjectMapper json, Executor commands, ScheduledExecutorService timers, int idleLimit) {
+    OpenAi(ObjectMapper json, Executor commands, ScheduledExecutorService timers, int idleLimit, long ttsReadyMs) {
         this.json = json;
         this.commands = commands;
         this.timers = timers;
         this.idleLimit = idleLimit;
-        var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(4));
+        this.ttsConnectBudget = Duration.ofMillis(ttsReadyMs);
+        var client = HttpClient.newBuilder().connectTimeout(
+                ttsConnectBudget.compareTo(ASR_CONNECT_BUDGET) > 0 ? ttsConnectBudget : ASR_CONNECT_BUDGET);
         String proxy = System.getenv("OPENAI_LIVE_HTTP_PROXY");
         if (proxy != null && !proxy.isBlank()) {
             URI uri = URI.create(proxy);
@@ -159,7 +163,7 @@ final class OpenAi {
                 return true;
             }
             openedAt = System.nanoTime();
-            opening = http.newWebSocketBuilder().connectTimeout(Duration.ofSeconds(4))
+            opening = http.newWebSocketBuilder().connectTimeout(SYNTHESIS.equals(query) ? ttsConnectBudget : ASR_CONNECT_BUDGET)
                     .header("Authorization", "Bearer " + key)
                     .buildAsync(URI.create(endpoint + query), this);
             outbound = opening.thenComposeAsync(ws -> write(ws, config.toString()), commands);

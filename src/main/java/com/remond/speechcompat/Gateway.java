@@ -81,7 +81,7 @@ public class Gateway implements WebSocketConfigurer {
         this.ttsSlots = new Semaphore(ttsLimit);
         this.asrResultTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(asrResultTimeoutMs);
         this.ttsTimeouts = ttsTimeouts;
-        this.upstream = new OpenAi(json, commands, timers, Math.min(ttsIdleLimit, ttsLimit));
+        this.upstream = new OpenAi(json, commands, timers, Math.min(ttsIdleLimit, ttsLimit), ttsTimeouts.readyMs());
         timers.setRemoveOnCancelPolicy(true);
     }
 
