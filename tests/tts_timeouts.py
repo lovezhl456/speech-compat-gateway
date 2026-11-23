@@ -19,6 +19,11 @@ def downsample(pcm):
 
 
 class TimeoutFixture(c.Fixture):
+    def do_GET(self):
+        if self.server.upgrade_delay:
+            time.sleep(self.server.upgrade_delay)
+        super().do_GET()
+
     def synthesize_model(self):
         if self.server.stall_ready:
             self.read_event("session.update")
@@ -32,9 +37,11 @@ class TimeoutFixture(c.Fixture):
             return super().render_tts(command, response, previous)
         self.event({"type": "response.created", "response": response})
         if probe == "long":
+            first, last = tone_frame(800), tone_frame(1600)
+            start = time.monotonic()
             for frame in range(125):
-                self.audio(response, tone_frame(800 if frame < 124 else 1600))
-                time.sleep(0.1)
+                self.audio(response, first if frame < 124 else last)
+                time.sleep(max(0, start + (frame + 1) * 0.1 - time.monotonic()))
             self.event({"type": "response.done", "response": {**response, "status": "completed"}})
             return True
         if probe in {"idle", "cancel", "reuse-idle"}:
@@ -47,14 +54,16 @@ class TimeoutFixture(c.Fixture):
         if probe == "reuse-idle":
             assert previous is not None
         # Empty or superseded deltas must not refresh the audio deadline.
-        for _ in range(40):
+        start = time.monotonic()
+        current_tone, previous_tone = tone_frame(800), tone_frame(2100)
+        for frame in range(40):
             if probe == "total":
-                self.audio(response, tone_frame(800))
+                self.audio(response, current_tone)
             elif probe == "reuse-idle":
-                self.audio(previous, tone_frame(2100))
+                self.audio(previous, previous_tone)
             else:
                 self.audio(response, b"")
-            time.sleep(0.09)
+            time.sleep(max(0, start + (frame + 1) * 0.09 - time.monotonic()))
         return False
 
     def audio(self, response, pcm):
@@ -138,9 +147,19 @@ def main():
     with ExitStack() as stack:
         fixture = stack.enter_context(c.FixtureServer(("127.0.0.1", 0), TimeoutFixture))
         fixture.lock = threading.Lock()
+        fixture.upgrade_delay = 0
         fixture.stall_ready = False
         threading.Thread(target=fixture.serve_forever, daemon=True).start()
         stack.callback(fixture.shutdown)
+        with ExitStack() as gateway:
+            port = c.launch(gateway, args, fixture, 0, "slow-upgrade.log",
+                            {**defaults, "COMPAT_TTS_READY_TIMEOUT_MS": "6500"})
+            fixture.upgrade_delay = 4.3
+            try:
+                audio = run_task(port, "800。", "SynthesisCompleted", "tts_completed", (4, 6.5))
+                assert audio == c.expected_pcm(800)
+            finally:
+                fixture.upgrade_delay = 0
         with ExitStack() as gateway:
             port = c.launch(gateway, args, fixture, 0, "progress.log", defaults)
             test_long_synthesis(port)

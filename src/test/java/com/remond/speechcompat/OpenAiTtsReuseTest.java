@@ -27,7 +27,7 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 class OpenAiTtsReuseTest {
     private final ScheduledExecutorService timers = Executors.newSingleThreadScheduledExecutor();
-    private final OpenAi pool = new OpenAi(new ObjectMapper(), Runnable::run, timers, 1);
+    private final OpenAi pool = new OpenAi(new ObjectMapper(), Runnable::run, timers, 1, 5000);
 
     @AfterEach
     void close() {
@@ -96,7 +96,7 @@ class OpenAiTtsReuseTest {
             if (!pausedEviction.compareAndSet(null, command)) {
                 command.run();
             }
-        }, timers, 1);
+        }, timers, 1, 5000);
         var first = controlled.stream(false, event -> CompletableFuture.completedFuture(null), () -> {}, ignored -> {});
         WebSocket socket = connect(first);
         park(controlled, first);
@@ -125,7 +125,7 @@ class OpenAiTtsReuseTest {
             assertTrue(resume.await(2, TimeUnit.SECONDS));
             return TextNode.valueOf("error");
         });
-        var controlled = new OpenAi(parser, Runnable::run, timers, 1);
+        var controlled = new OpenAi(parser, Runnable::run, timers, 1, 5000);
         var first = controlled.stream(false, item -> CompletableFuture.completedFuture(null), () -> {}, ignored -> {});
         WebSocket socket = connect(first);
         park(controlled, first);
